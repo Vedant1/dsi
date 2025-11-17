@@ -1,4 +1,3 @@
-# app.py
 import sqlite3
 from contextlib import closing
 from datetime import date, timedelta
@@ -6,7 +5,9 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
+import time
 
+IDLE_SECONDS = 60 * 60 # 2 hours
 DB_PATH = "clients.db"
 PAY_FREQ = ['Weekly','Biweekly','Semi-Monthly','Monthly']
 
@@ -24,7 +25,6 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 client_name TEXT NOT NULL,
                 assigned_user_id INTEGER NOT NULL,
-                assigned_user_name TEXT NOT NULL,
                 pay_frequency TEXT NOT NULL CHECK(pay_frequency IN ({str(PAY_FREQ)[1:-1]})),
                 pay_start_date TEXT NOT NULL,
                 processing_date TEXT NOT NULL,
@@ -42,6 +42,7 @@ def init_db():
                 incr_add_employee_fee REAL NOT NULL,
                 payroll_registration INTEGER NOT NULL CHECK(payroll_registration IN (0,1)),
                 registration_fee REAL NOT NULL,
+                free_state_used INTEGER NOT NULL CHECK(free_state_used IN (0,1)),
                 terminated INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(assigned_user_id) REFERENCES users(id)
             );
@@ -52,41 +53,39 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clients_fee_eff ON clients(fee_increase_effective_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_clients_name ON clients(client_name)")
         
-        # to add after client_id:   assigned_employee_id INTEGER NOT NULL,
-        # to add at end:            FOREIGN KEY(assigned_employee_id) REFERENCES users(id)
+        # to add after client_id:   assigned_user_id INTEGER NOT NULL,
+        # to add at end:            FOREIGN KEY(assigned_user_id) REFERENCES users(id)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 client_id INTEGER NOT NULL,
+
                 period_type TEXT NOT NULL CHECK(period_type IN ('regular','additional')),
                 pay_frequency TEXT NOT NULL,
                 pay_start_date TEXT NOT NULL,
                 pay_end_date TEXT NOT NULL,
                 processing_date TEXT NOT NULL,
                 pay_date TEXT NOT NULL,
-                
                 base_fee REAL NOT NULL,
                 num_states_in_base_fee INTEGER NOT NULL,
                 num_employees_in_base_fee INTEGER NOT NULL,
                 add_state_fee REAL NOT NULL,
                 add_employee_fee REAL NOT NULL,
-
                 num_employees_processed INTEGER NOT NULL,
                 num_states_processed INTEGER NOT NULL,
-
                 payroll_registration INTEGER NOT NULL,
                 registration_fee REAL NOT NULL,
-
                 registration_this_period INTEGER NOT NULL CHECK(registration_this_period IN (0,1)),
                 num_states_registered INTEGER NOT NULL,
-
+                free_state_used INTEGER NOT NULL CHECK(free_state_used IN (0,1)),              
                 cost REAL NOT NULL,
                 collected REAL NOT NULL DEFAULT 0,
                 collection_description TEXT NOT NULL DEFAULT '',
                 collection_date TEXT,
                 net_amount REAL NOT NULL DEFAULT 0,
                 FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
+
             );
             """
         )
@@ -110,9 +109,13 @@ def init_db():
             """
         )
 
-def check_active_clients():
+def check_active_clients() -> bool:
     with closing(get_conn()) as conn, conn:
         return bool(conn.execute(f"SELECT EXISTS(SELECT 1 FROM clients WHERE terminated = 0);").fetchone()[0])
+
+def check_payment_history(client_id: int) -> bool:
+    with closing(get_conn()) as conn, conn:
+        return bool(conn.execute(f"SELECT EXISTS(SELECT 1 FROM transactions WHERE client_id = {client_id});").fetchone()[0])
 
 def new_entry(table: str, payload: dict):
     cols = ", ".join(payload.keys())
@@ -131,50 +134,70 @@ def update_entry(table: str, entry_id: int, payload: dict):
     with closing(get_conn()) as conn, conn:
         conn.execute(f"UPDATE {table} SET {sets} WHERE id = ?", values)
 
-def show_clients(terminated: bool, order_by: str = "ID", ascending: bool = True) -> pd.DataFrame:
-    select_cols = ["id", "assigned_user_name", "client_name", "pay_frequency", "processing_date", 
-                   "pay_date", "fee_increase_effective_date"]
+def show_clients(terminated: bool, order_by: str = "Processing Date", ascending: bool = True) -> pd.DataFrame:
+    select_cols = ["c.id AS id", "u.user_name AS assigned_user_name", "c.client_name AS client_name", 
+                   "c.pay_frequency AS pay_frequency", "c.processing_date AS processing_date", 
+                   "c.pay_date AS pay_date", "c.fee_increase_effective_date AS fee_increase_effective_date"]
     cols_str = ",".join(select_cols)
 
     allowed = {
         "ID": "id",
-        "Client Name": "client_name COLLATE NOCASE",
-        "Assigned User": "assigned_user_name COLLATE NOCASE",
-        "Pay Frequency": "pay_frequency COLLATE NOCASE",
-        "Processing Date": "date(processing_date)",
-        "Pay Date": "date(pay_date)"
+        "Client Name": "c.client_name COLLATE NOCASE",
+        "Assigned User": "u.user_name COLLATE NOCASE",
+        "Pay Frequency": "c.pay_frequency COLLATE NOCASE",
+        "Processing Date": "date(c.processing_date)",
+        "Pay Date": "date(c.pay_date)"
     }
-    order_expr = allowed.get(order_by, "ID")
     direction = "ASC" if ascending else "DESC"
 
     with closing(get_conn()) as conn:
-        return pd.read_sql_query(f"""SELECT {cols_str} FROM clients WHERE terminated = {int(terminated)} 
-                                 ORDER BY {order_expr} {direction}, id ASC""", conn)
+        return pd.read_sql_query(f"""SELECT {cols_str} 
+                                 FROM clients c
+                                 LEFT JOIN users u on u.id = c.assigned_user_id
+                                 WHERE c.terminated = {int(terminated)} 
+                                 ORDER BY {allowed[order_by]} {direction}, c.id ASC""", conn)
     
-def get_client_payments(client_id: int, order_field: str, display_cols: list = None) -> pd.DataFrame:
+def get_client_payments(client_id: int, display_cols: list = None, 
+                        order_by: str = "Processing Date", ascending: bool = False) -> pd.DataFrame:
     default_cols = "id, period_type, pay_start_date, pay_end_date, processing_date, cost"
+
+    allowed = {
+        "Payment Type": "period_type COLLATE NOCASE",
+        "Start Date": "date(pay_start_date)",
+        "End Date": "date(pay_end_date)",
+        "Processing Date": "date(processing_date)",
+        "Cost": "cost"
+    }
+    direction = "ASC" if ascending else "DESC"
+
     if display_cols:
         default_cols = ",".join(display_cols)
     with closing(get_conn()) as conn:
-        return pd.read_sql_query(f"""SELECT {default_cols}
-                                 FROM transactions WHERE client_id = {client_id} ORDER BY {order_field} DESC""", conn)
+        return pd.read_sql_query(f"""SELECT {default_cols} FROM transactions WHERE client_id = {client_id} 
+                                 ORDER BY {allowed[order_by]} {direction}, id ASC""", conn)
     
-def get_payment_aggregates() -> pd.DataFrame:
+def get_payment_aggregates(order_by: str = "Amount Receivable", ascending: bool = False) -> pd.DataFrame:
     """Per-client sums of cost, collected, net_amount."""
+    allowed = {
+        "Client Name":       "client_name COLLATE NOCASE",
+        "Total Fee":         "total_cost",
+        "Amount Collected":  "total_collected",
+        "Amount Receivable": "net_amount",
+    }
+    direction = "ASC" if ascending else "DESC"
+
     with closing(get_conn()) as conn:
-        df = pd.read_sql_query(
-            """
+        return pd.read_sql_query(
+            f"""
             SELECT 
-                c.id AS client_id, c.client_name,
+                c.id AS client_id, c.client_name AS client_name,
                 COALESCE(SUM(t.cost),0) AS total_cost,
-                COALESCE(SUM(t.collected),0) AS total_collected
+                COALESCE(SUM(t.collected),0) AS total_collected,
+                COALESCE(SUM(t.cost),0) - COALESCE(SUM(t.collected),0) as net_amount
             FROM clients c
             LEFT JOIN transactions t ON t.client_id = c.id
             WHERE c.terminated = 0
-            GROUP BY c.id, c.client_name ORDER BY c.id ASC
-            """, conn)
-        df["net_amount"] = df["total_cost"] - df["total_collected"]
-        return df
+            GROUP BY c.id, c.client_name ORDER BY {allowed[order_by]} {direction}, c.id ASC""", conn)
 
 def update_client_payments(updates: pd.DataFrame):
     """Updates all payments for this client"""
@@ -230,7 +253,8 @@ def get_latest_pay_end_date(client_id: int) -> Optional[date]:
 
 def get_client_net_amount(client_id: int) -> float:
     with closing(get_conn()) as conn:
-        val = conn.execute(f"SELECT COALESCE(SUM(net_amount), 0) FROM transactions WHERE client_id = {client_id}").fetchone()[0]
+        val = conn.execute(f"""SELECT COALESCE(SUM(cost),0) - COALESCE(SUM(collected),0) as net_amount
+                           FROM transactions WHERE client_id = {client_id}""").fetchone()[0]
         return float(val or 0.0)
 
 def get_users(select_cols: list = None) -> pd.DataFrame:
@@ -241,14 +265,12 @@ def get_users(select_cols: list = None) -> pd.DataFrame:
         return pd.read_sql_query(f"SELECT {default_cols} FROM users", conn)
 
 def delete_user(user_id: int):
-        with closing(get_conn()) as conn, conn:
-            conn.execute(f"DELETE FROM users WHERE id = {user_id};")
+    with closing(get_conn()) as conn, conn:
+        conn.execute(f"DELETE FROM users WHERE id = {user_id};")
 
 def rollover_fees_for_today(today_iso: str):
     """
-    Promote increased fees to current, push effective date +1 year,
-    and (if use_pct_increase=1) precompute the next cycle increased fees.
-    Only affects active (terminated=0) clients whose effective date is today.
+    Promote increased fees to current, push effective date +1 year. Only if today is effective date
     """
     with closing(get_conn()) as conn, conn:
         conn.execute(
@@ -266,6 +288,48 @@ def rollover_fees_for_today(today_iso: str):
             WHERE terminated = 0 AND fee_increase_effective_date = ?
             """, (today_iso,)
         )
+
+def get_clients_for_user(user_id: int) -> pd.DataFrame:
+    """Return clients assigned to the given user."""
+    with closing(get_conn()) as conn:
+        return pd.read_sql_query(f"SELECT client_name FROM clients WHERE assigned_user_id = {user_id}", conn)["client_name"].tolist()
+
+# ---------- Auth / Users helpers ----------
+def db_is_first_time() -> bool:
+    """Treat as first-time if users and clients tables are both empty."""
+    with closing(get_conn()) as conn:
+        u_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        c_count = conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+        return (u_count == 0 and c_count == 0)
+
+def get_user_by_email(email: str) -> Optional[pd.Series]:
+    with closing(get_conn()) as conn:
+        df = pd.read_sql_query("SELECT * FROM users WHERE lower(email) = lower(?) LIMIT 1", conn, params=(email,))
+    return df.iloc[0] if not df.empty else None
+
+def verify_credentials(email: str, password: str) -> Optional[pd.Series]:
+    with closing(get_conn()) as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM users WHERE lower(email) = lower(?) AND password = ? LIMIT 1",
+            conn,
+            params=(email, password),
+        )
+    return df.iloc[0] if not df.empty else None
+
+def create_permanent_admin(name: str, email: str, password: str):
+    """Create the single permanent Admin (permanent=1)."""
+    payload = {
+        "user_name": name.strip(),
+        "user_type": "Admin",
+        "email": email.strip().lower(),
+        "password": password,
+        "permanent": 1,
+    }
+    new_entry("users", payload)
+
+def set_password_for_email(email: str, password: str):
+    with closing(get_conn()) as conn, conn:
+        conn.execute("UPDATE users SET password = ? WHERE lower(email) = lower(?)", (password, email.lower()))
 
 
 # ---------- Reports ----------
@@ -313,30 +377,29 @@ def df_collections_overview_range(start_dt: date, end_dt: date) -> pd.DataFrame:
             df[col] = df[col].astype(float).round(2)
         return df
 
-def df_num_employees_in_range(start_dt: date, end_dt: date) -> pd.DataFrame:
+def df_sum_employees_in_range(start_dt: date, end_dt: date) -> pd.DataFrame:
     """
     Show number of employees processed for each transaction whose processing_date is within [start_dt, end_dt].
     Returns columns: client_name, num_employees_processed.
     """
     with closing(get_conn()) as conn:
-        df = pd.read_sql_query(
+        return pd.read_sql_query(
             f"""
             SELECT 
-                c.client_name AS "Client Name",
-                t.processing_date AS "Processed Date",
-                t.num_employees_processed AS "Num Employees Processed"
+                c.client_name                               AS "Client Name",
+                COALESCE(SUM(t.num_employees_processed), 0) AS "Num Employees Processed"
             FROM transactions t
             JOIN clients c ON c.id = t.client_id
             WHERE date(t.processing_date) BETWEEN date('{start_dt.isoformat()}') AND date('{end_dt.isoformat()}')
-            ORDER BY c.client_name ASC, t.processing_date ASC
+            GROUP BY c.client_name
+            ORDER BY c.client_name ASC
             """, conn
         )
-        df["Processed Date"] = pd.to_datetime(df["Processed Date"], errors="coerce").dt.strftime("%m/%d/%Y")
-        return df
 
 
 # ---------- Nav helpers ---------
 def set_page(page: str, **kwargs):
+    mark_activity()
     st.query_params.clear()
     st.query_params.update({"page": page, **{k:str(v) for k,v in kwargs.items()}})
 
@@ -369,15 +432,10 @@ def advance_pay_start_date(current_start: date, freq: str) -> date:
             return date(current_start.year, current_start.month, 16)
         if current_start.day == 16:
             return first_of_next_month(current_start)
-        else:
-            st.warning("Pay Start Date has to be the 1st or 16th of the month")
-            return None
     elif freq == PAY_FREQ[3]: # Monthly
         if current_start.day == 1:
             return first_of_next_month(current_start)
-        else:
-            st.warning("Pay Start Date has to be the 1st of the month")
-            return None
+    return None
 
 def pct_increase(val: float, pct: float) -> float:
     return round(val * (1 + (pct / 100.0)), 2)
@@ -385,7 +443,7 @@ def pct_increase(val: float, pct: float) -> float:
 def calc_cost(base_fee: float, add_state_fee: float, add_employee_fee: float,
               num_states_in_base_fee: int, num_employees_in_base_fee: int, payroll_registration: int,
               registration_fee: float, num_states_processed: int, num_employees_processed: int,
-              registration_this_period: bool, num_states_registered: int) -> float:
+              registration_this_period: bool, num_states_registered: int, free_state_used: bool) -> float:
     extra_states = max(0, num_states_processed - int(num_states_in_base_fee))
     extra_emps = max(0, num_employees_processed - int(num_employees_in_base_fee))
 
@@ -394,7 +452,10 @@ def calc_cost(base_fee: float, add_state_fee: float, add_employee_fee: float,
     total += extra_emps * float(add_employee_fee)
 
     if registration_this_period and int(payroll_registration) == 1:
-        num_register_states = max(0, num_states_registered - int(num_states_in_base_fee))
+        if free_state_used:
+            num_register_states = num_states_registered
+        else:
+            num_register_states = max(0, num_states_registered - int(num_states_in_base_fee))
         total += num_register_states * registration_fee
 
     return round(total, 2)
@@ -414,7 +475,13 @@ def maybe_rollover_fees_for_today():
         return
     rollover_fees_for_today(today_iso)
     st.session_state["last_rollover_date"] = today_iso
-    
+
+def get_err(error_dict, field):
+    return st.session_state[error_dict].get(field)
+
+def mark_activity():
+    st.session_state["last_activity"] = time.time()
+
 # ------- Dialog Screens -------
 @st.dialog("Confirm new pay period")
 def submit_period_dialog(staged: dict, client: pd.Series):
@@ -429,14 +496,20 @@ def submit_period_dialog(staged: dict, client: pd.Series):
             next_start = advance_pay_start_date(start_dt, client.pay_frequency)
             next_processing_date = next_start + timedelta(days=(date.fromisoformat(client.processing_date) - start_dt).days)
             next_pay_date = next_start + timedelta(days=(date.fromisoformat(client.pay_date) - start_dt).days)
+            
+            free_state_used = int(staged["free_state_used"])
+            if staged["num_states_registered"] > 0 and staged["num_states_in_base_fee"] > 0:
+                free_state_used = 1
+
             update_entry("clients", int(client.id), {"pay_start_date": next_start.isoformat(),
                                                      "processing_date": next_processing_date.isoformat(),
-                                                     "pay_date": next_pay_date.isoformat()
-            })
+                                                     "pay_date": next_pay_date.isoformat(),
+                                                     "free_state_used": free_state_used  })
             st.session_state["reg_period"] = True
         else:
             st.session_state["add_period"] = True
 
+        st.session_state["new_payroll_errors"] = {}
         set_page("home_detail", id=int(client.id))
         st.rerun()
 
@@ -453,12 +526,28 @@ def skip_period_dialog(client_id, next_start, next_processing_date, next_pay_dat
                                                  "processing_date": next_processing_date,
                                                  "pay_date": next_pay_date})
 
+        st.session_state["new_payroll_errors"] = {}
         set_page("home_detail", id=int(client_id))
         st.rerun()
 
     if b.button("Cancel", width="stretch"):
         st.rerun()
 
+@st.dialog("Submit edited pay period info")
+def edit_period_dialog(client_id, txn_id, edited_entry):
+    st.write("Are you sure you want to edit this pay period?")
+
+    a, b = st.columns(2)
+    if a.button("✅ Save Changes", type="primary", width="stretch"):
+        update_entry("transactions", txn_id, edited_entry)
+        st.session_state["edited_txn"] = True
+        st.session_state["edit_payroll_errors"] = {}
+        set_page("home_detail", id=client_id)
+        st.rerun()
+
+    if b.button("Cancel", width="stretch"):
+        st.rerun()
+        
 @st.dialog("Cannot terminate client")
 def cannot_terminate_dialog(client_name: str, net_amt: float):
     st.error(f"**{client_name}** cannot be terminated due to an outstanding balance of **${net_amt:,.2f}**.")
@@ -471,7 +560,7 @@ def confirm_terminate_dialog(client_id: int, client_name: str):
     c1, c2 = st.columns(2)
     if c1.button("Yes, terminate", type="primary", key=f"term_yes_{client_id}", width="stretch"):
         update_entry("clients", client_id, {"terminated": 1})
-        st.session_state["terminated_msg"] = True
+        st.session_state["terminated_msg"] = client_name
         set_page("main")
         st.rerun()
 
@@ -489,7 +578,7 @@ def reactivate_dialog(client_id, client_name, current_eff):
             st.error("New Effective Date must be after today.")
         else:
             update_entry("clients", client_id, {"fee_increase_effective_date": new_eff.isoformat(), "terminated": 0})
-            st.session_state["reactivated_msg"] = True
+            st.session_state["reactivated_msg"] = client_name
             st.rerun()
 
     if b.button("Cancel", key=f"react_cancel_{client_id}", width="stretch"):
@@ -502,17 +591,28 @@ def confirm_delete_user_dialog(user_id: int, user_name: str):
     d,e = st.columns(2)
     if d.button("Delete", type="primary", key=f"del_yes_{user_id}", width="stretch"):
         delete_user(user_id)
-        st.session_state["deleted_msg"] = True
+        st.session_state["deleted_msg"] = user_name
         st.rerun()
 
     if e.button("Cancel", key=f"del_no_{user_id}", width="stretch"):
         st.rerun()
 
+@st.dialog("Cannot delete user")
+def cannot_delete_user_dialog(user_name: str, assigned_clients: list):
+    n = len(assigned_clients)
+    st.error(f"**{user_name}** cannot be deleted because they are assigned to {n} client{'s' if n > 1 else ''}.")
+    if n > 0:
+        st.write("• " + "\n\n• ".join(assigned_clients))
+    if st.button("Close", width='stretch'):
+        st.rerun()
 
 # ------- Payroll Screen Helpers -------
 def render_period(period_type, client_id):
     st.markdown(f"### {period_type.capitalize()} Pay Period")
     client = fetch_row("clients", client_id)
+
+    if "new_payroll_errors" not in st.session_state:
+        st.session_state["new_payroll_errors"] = {}
     
     if period_type == "regular":
         ro1, ro2, ro3 = st.columns(3)
@@ -525,24 +625,33 @@ def render_period(period_type, client_id):
     else:
         ro1, ro2 = st.columns(2)
         start_dt = ro1.date_input("Pay Start Date", value=None, format="MM/DD/YYYY")
+        if msg := get_err("new_payroll_errors", "show_start_dt_error"): ro1.error(msg)
         end_dt = ro2.date_input("Pay End Date", value=None, format="MM/DD/YYYY")
+        if msg := get_err("new_payroll_errors", "show_end_dt_error"): ro2.error(msg)
         next_start = None
 
     d1, d2 = st.columns(2)
-    processing_date = d1.date_input("Processing Date*", value=date.fromisoformat(client.processing_date) if period_type == "regular" else None, format="MM/DD/YYYY")
-    pay_date = d2.date_input("Pay Date*", value=date.fromisoformat(client.pay_date) if period_type == "regular" else None, format="MM/DD/YYYY")
+    processing_date = d1.date_input("Processing Date*", format="MM/DD/YYYY", 
+                                    value=date.fromisoformat(client.processing_date) if period_type == "regular" else None)
+    if msg := get_err("new_payroll_errors", "show_process_dt_error"): d1.error(msg)
+    pay_date = d2.date_input("Pay Date*", format="MM/DD/YYYY", 
+                             value=date.fromisoformat(client.pay_date) if period_type == "regular" else None)
+    if msg := get_err("new_payroll_errors", "show_pay_dt_error"): d2.error(msg)
 
     e1, e2 = st.columns(2)
     n_emp = e1.number_input("Number of Employees*", min_value=1, step=1, value=None)
+    if msg := get_err("new_payroll_errors", "show_num_ee_error"): e1.error(msg)
     n_states = e2.number_input("Number of States*", min_value=1, step=1, value=None)
-
+    if msg := get_err("new_payroll_errors", "show_num_st_error"): e2.error(msg)
+    
     registration_this_period = False
     num_register_states = 0
     if int(client.payroll_registration) == 1:
-        register_choice = st.radio("Register States?", options=["Yes", "No"], index=1, horizontal=True)
+        register_choice = st.radio("Register New States?", options=["Yes", "No"], index=1, horizontal=True)
         registration_this_period = (register_choice == "Yes")
         if registration_this_period:
             num_register_states = st.number_input("Number of States Registered*", min_value=0, step=1, value=None)
+            if msg := get_err("new_payroll_errors", "show_num_st_reg_error"): st.error(msg)
 
     st.markdown("<br>", unsafe_allow_html=True)
     if period_type == "regular":
@@ -556,6 +665,7 @@ def render_period(period_type, client_id):
         cancel_clicked = b.button("Cancel", width='stretch')
 
     if cancel_clicked:
+        st.session_state["new_payroll_errors"] = {}
         set_page("home_detail", id=client_id)
         st.rerun()
 
@@ -565,35 +675,37 @@ def render_period(period_type, client_id):
         skip_period_dialog(int(client_id), next_start.isoformat(), next_processing_date.isoformat(), next_pay_date.isoformat())
 
     if submit_clicked:
-        errs = []
         if period_type == "additional":
             if start_dt is None:
-                errs.append("• Pay Start Date is required.")
-            else:
-                ok, msg = validate_start_date(client.pay_frequency, start_dt)
-                if not ok:
-                    errs.append(f"• {msg}")
+                st.session_state["new_payroll_errors"]["show_start_dt_error"] = "Pay Start Date is required"
+            else: st.session_state["new_payroll_errors"].pop("show_start_dt_error", None)
             if end_dt is None:
-                errs.append("• Pay End Date is required.")
+                st.session_state["new_payroll_errors"]["show_end_dt_error"] = "Pay End Date is required"
             elif start_dt and end_dt <= start_dt:
-                errs.append("• Pay End Date should be after Pay Start Date.")
+                st.session_state["new_payroll_errors"]["show_end_dt_error"] = "Pay End Date should be after Pay Start Date."
+            else: st.session_state["new_payroll_errors"].pop("show_end_dt_error", None)
         if processing_date is None:
-            errs.append("• Processing Date is required.")
+            st.session_state["new_payroll_errors"]["show_process_dt_error"] = "Processing Date is required"
         elif end_dt and processing_date < end_dt:
-            errs.append("• Processing Date must be on/after the Pay End Date.")
+            st.session_state["new_payroll_errors"]["show_process_dt_error"] = "Processing Date must be on/after Pay End Date"
+        else: st.session_state["new_payroll_errors"].pop("show_process_dt_error", None)
         if pay_date is None:
-            errs.append("• Pay Date is required.")
+            st.session_state["new_payroll_errors"]["show_pay_dt_error"] = "Pay Date is required"
         elif processing_date and pay_date < processing_date:
-            errs.append("• Pay Date must be on/after the Processing Date.")
+            st.session_state["new_payroll_errors"]["show_pay_dt_error"] = "Pay Date must be on/after Processing Date"
+        else: st.session_state["new_payroll_errors"].pop("show_pay_dt_error", None)
         if n_emp is None:
-            errs.append("• Number of Employees must be > 0.")
+            st.session_state["new_payroll_errors"]["show_num_ee_error"] = "Number of Employees must be > 0."
+        else: st.session_state["new_payroll_errors"].pop("show_num_ee_error", None)
         if n_states is None:
-            errs.append("• Number of States must be > 0.")
+            st.session_state["new_payroll_errors"]["show_num_st_error"] = "Number of States must be > 0."
+        else: st.session_state["new_payroll_errors"].pop("show_num_st_error", None)
         if registration_this_period and (num_register_states is None or num_register_states <= 0):
-            errs.append("• Number of States Registered must be > 0.")
+            st.session_state["new_payroll_errors"]["show_num_st_reg_error"] = "Number of States Registered must be > 0."
+        else: st.session_state["new_payroll_errors"].pop("show_num_st_reg_error", None)
 
-        if errs:
-            st.error("Please fix the following:\n\n" + "\n\n".join(errs))
+        if st.session_state["new_payroll_errors"]:
+            st.rerun()
         else:
             snap = {
                 "base_fee": float(client.base_fee),
@@ -606,7 +718,8 @@ def render_period(period_type, client_id):
                 "num_states_processed": int(n_states),
                 "num_employees_processed": int(n_emp),
                 "registration_this_period": registration_this_period,
-                "num_states_registered": int(num_register_states or 0)
+                "num_states_registered": int(num_register_states or 0),
+                "free_state_used": bool(client.free_state_used)
             }
             cost = calc_cost(**snap)
             new_period = {
@@ -619,9 +732,13 @@ def render_period(period_type, client_id):
 
             submit_period_dialog(new_period, client)
 
-def render_edit_period(client_id: int, txn_id: int):
+def render_edit_period(txn_id: int):
     txn = fetch_row("transactions", txn_id)
+    client_id = int(txn.client_id)
     st.markdown(f"### Edit {txn.period_type.capitalize()} Pay Period")
+
+    if "edit_payroll_errors" not in st.session_state:
+        st.session_state["edit_payroll_errors"] = {}
     
     if txn.period_type == "regular":
         ro1, ro2, ro3 = st.columns(3)
@@ -634,12 +751,15 @@ def render_edit_period(client_id: int, txn_id: int):
         ro1, ro2 = st.columns(2)
         start_dt = ro1.date_input("Pay start date*", value=date.fromisoformat(txn.pay_start_date), format="MM/DD/YYYY")
         end_dt = ro2.date_input("Pay end date*", value=date.fromisoformat(txn.pay_end_date), format="MM/DD/YYYY")
-
+        if msg := get_err("edit_payroll_errors", "show_end_dt_error"): ro2.error(msg)
+        
     st.markdown("<br>", unsafe_allow_html=True)
     g1, g2, g3 = st.columns(3)
     base_fee = g1.number_input("Base Fee*", min_value=1.0, step=1.0, format="%.2f", value=txn.base_fee)
-    num_states = g2.number_input("Number of States in Base Fee*", min_value=0, step=1, value=int(txn.num_states_in_base_fee))
-    num_employees = g3.number_input("Number of Employees in Base Fee*", min_value=0, step=1, value=int(txn.num_employees_in_base_fee))
+    num_employees = g2.number_input("Number of Employees in Base Fee*", min_value=0, step=1, value=int(txn.num_employees_in_base_fee))
+    g3.number_input("Number of States in Base Fee*", value=int(txn.num_states_in_base_fee), disabled=True, 
+                    help="Disabled for consistent payroll registration calculation.")
+    
     f1, f2 = st.columns(2)
     add_state_fee = f1.number_input("Additional State Fee*", min_value=1.0, step=1.0, format="%.2f", value=txn.add_state_fee)
     add_emp_fee = f2.number_input("Additional Employee Fee*", min_value=1.0, step=1.0, format="%.2f", value=txn.add_employee_fee)
@@ -647,87 +767,164 @@ def render_edit_period(client_id: int, txn_id: int):
 
     e1, e2 = st.columns(2)
     processing_date = e1.date_input("Processing Date*", value=date.fromisoformat(txn.processing_date), format="MM/DD/YYYY")
+    if msg := get_err("edit_payroll_errors", "show_process_dt_error"): e1.error(msg)
     pay_date = e2.date_input("Pay Date*", value=date.fromisoformat(txn.pay_date), format="MM/DD/YYYY")
-    
+    if msg := get_err("edit_payroll_errors", "show_pay_dt_error"): e2.error(msg)
+
     d1, d2 = st.columns(2)
     n_emp = d1.number_input("Number of Employees*", min_value=1, step=1, value=int(txn.num_employees_processed))
     n_states = d2.number_input("Number of States*", min_value=1, step=1, value=int(txn.num_states_processed))
 
-    registration_this_period = bool(int(txn.registration_this_period))
-
-    if int(txn.payroll_registration) == 1:
-        register_choice = st.radio("Register States?", options=["Yes", "No"], index=0 if registration_this_period else 1, horizontal=True)
-        registration_this_period = (register_choice == "Yes")
-        if registration_this_period:
-            registration_fee = st.number_input("Registration Fee*", min_value=0.0, step=1.0, format="%.2f", value=float(txn.registration_fee))
-            num_register_states = st.number_input("Number of States Registered*", min_value=0, step=1, value=int(txn.num_states_registered))
-        else:
-            registration_fee = txn.registration_fee
-            num_register_states = 0
-    else:
-        registration_this_period = False
-        registration_fee = 0.0
-        num_register_states = 0
-
     st.markdown("<br>", unsafe_allow_html=True)
-    a, b = st.columns([1, 1])
+    a, b = st.columns(2)
     save_clicked = a.button("Save changes", type="primary", width='stretch')
     cancel_clicked = b.button("Cancel", width='stretch')
 
     if cancel_clicked:
+        st.session_state["edit_payroll_errors"] = {}
         set_page("home_detail", id=client_id)
         st.rerun()
 
     if save_clicked:
-        errs = []
-
         if txn.period_type == "additional":
-            if start_dt is None:
-                errs.append("• Pay Start Date is required.")
-            else:
-                ok, msg = validate_start_date(txn.pay_frequency, start_dt)
-                if not ok:
-                    errs.append(f"• {msg}")
-            if end_dt is None:
-                errs.append("• Pay End Date is required.")
-            elif start_dt and end_dt <= start_dt:
-                errs.append("• Pay End Date should be after Pay Start Date.")
-        if processing_date is None:
-            errs.append("• Processing Date is required.")
-        elif end_dt and processing_date < end_dt:
-            errs.append("• Processing Date must be on/after the Pay End Date.")
-        if pay_date is None:
-            errs.append("• Pay Date is required.")
-        elif processing_date and pay_date < processing_date:
-            errs.append("• Pay Date must be on/after the Processing Date.")
-        if n_emp is None:
-            errs.append("• Number of Employees must be > 0.")
-        if n_states is None:
-            errs.append("• Number of States must be > 0.")
-        if registration_this_period and (num_register_states is None or num_register_states <= 0):
-            errs.append("• Number of States Registered must be > 0.")
+            if end_dt <= start_dt:
+                st.session_state["edit_payroll_errors"]["show_end_dt_error"] = "Pay End Date should be after Pay Start Date."
+            else: st.session_state["edit_payroll_errors"].pop("show_end_dt_error", None)
+        if processing_date < end_dt:
+            st.session_state["edit_payroll_errors"]["show_process_dt_error"] = "Processing Date must be on/after Pay End Date"
+        else: st.session_state["edit_payroll_errors"].pop("show_process_dt_error", None)
+        if pay_date < processing_date:
+            st.session_state["edit_payroll_errors"]["show_pay_dt_error"] = "Pay Date must be on/after Processing Date"
+        else: st.session_state["edit_payroll_errors"].pop("show_pay_dt_error", None)
 
-        if errs:
-            st.error("Please fix the following:\n\n" + "\n\n".join(errs))
+        if st.session_state["edit_payroll_errors"]:
+            st.rerun()
         else:
             snap = {
                 "base_fee": float(base_fee),
                 "add_state_fee": float(add_state_fee),
                 "add_employee_fee": float(add_emp_fee),
-                "num_states_in_base_fee": int(num_states),
+                "num_states_in_base_fee": int(txn.num_states_in_base_fee),
                 "num_employees_in_base_fee": int(num_employees),
                 "num_states_processed": int(n_states),
                 "num_employees_processed": int(n_emp),
-                "registration_this_period": registration_this_period,
-                "registration_fee": float(registration_fee),
-                "num_states_registered": int(num_register_states or 0)
+                "registration_this_period": int(txn.registration_this_period),
+                "registration_fee": float(txn.registration_fee),
+                "num_states_registered": int(txn.num_states_registered),
+                "free_state_used": bool(txn.free_state_used)
             }
             cost = calc_cost(**snap, payroll_registration=txn.payroll_registration)
-            update_entry("transactions", txn_id, {"pay_start_date": start_dt.isoformat(), "pay_end_date": end_dt.isoformat(),
-                                                  "processing_date": processing_date.isoformat(), "cost": float(cost), **snap})
-            st.session_state["edited_txn"] = True
-            set_page("home_detail", id=client_id)
-            st.rerun()
+            edited_entry = {
+                "pay_start_date": start_dt.isoformat(), "pay_end_date": end_dt.isoformat(),
+                "processing_date": processing_date.isoformat(), "cost": float(cost), **snap
+            }
+            edit_period_dialog(client_id, txn_id, edited_entry)
+
+
+
+# ---------- Auth Screens ----------
+def render_first_time_setup():
+    st.title("Welcome First-time Setup")
+    st.write("Create the initial Admin** account.")
+    name = st.text_input("Your Name*", value=None, key="ft_name")
+    email = st.text_input("Email (must end with @gmail.com)*", value=None, key="ft_email")
+    pwd1 = st.text_input("Password*", type="password", key="ft_pwd1")
+    pwd2 = st.text_input("Confirm Password*", type="password", key="ft_pwd2")
+
+    create_clicked = st.button("Create Admin", type="primary", use_container_width=True)
+
+    if create_clicked:
+        errors = []
+        if not name or not name.strip():
+            errors.append("• Name is required.")
+        if not email or not email.strip().lower().endswith("@gmail.com"):
+            errors.append("• Email must end with @gmail.com.")
+        if not pwd1:
+            errors.append("• Password is required.")
+        if pwd1 != pwd2:
+            errors.append("• Passwords do not match.")
+
+        if errors:
+            st.error("Please fix the following:\n\n" + "\n\n".join(errors))
+            return
+
+        create_permanent_admin(name, email, pwd1)
+        # Log them in immediately
+        user = get_user_by_email(email)
+        st.session_state["auth_user"] = {
+            "id": int(user.id),
+            "name": user.user_name,
+            "email": user.email,
+            "user_type": user.user_type,
+            "permanent": int(user.permanent),
+        }
+        st.success("Admin account created. Redirecting…")
+        st.rerun()
+
+def render_login_register():
+    st.title("Sign in")
+    st.caption("Use your email and password. For new users, click **Register** below.")
+
+    # --- Sign in ---
+    with st.container(border=True):
+        st.subheader("Existing user")
+        email_si = st.text_input("Email", key="si_email")
+        pwd_si = st.text_input("Password", type="password", key="si_pwd")
+        sign_in = st.button("Sign in", type="primary")
+
+        if sign_in:
+            user = verify_credentials(email_si.strip().lower(), pwd_si)
+            if user is None:
+                st.error("Invalid email or password.")
+            else:
+                st.session_state["auth_user"] = {
+                    "id": int(user.id),
+                    "name": user.user_name,
+                    "email": user.email,
+                    "user_type": user.user_type,
+                    "permanent": int(user.permanent),
+                }
+                st.rerun()
+
+    # --- Register (email must already exist in Users table) ---
+    with st.container(border=True):
+        st.subheader("Register (new user)")
+        st.caption("Your email must already exist in **Users** (added by an Admin).")
+        email_rg = st.text_input("Email (must end with @gmail.com)", key="rg_email")
+        pwd1_rg = st.text_input("Create password", type="password", key="rg_pwd1")
+        pwd2_rg = st.text_input("Confirm password", type="password", key="rg_pwd2")
+        register = st.button("Register")
+
+        if register:
+            errs = []
+            if not email_rg or not email_rg.strip().lower().endswith("@gmail.com"):
+                errs.append("• Email must end with @gmail.com.")
+            if not pwd1_rg:
+                errs.append("• Password is required.")
+            if pwd1_rg != pwd2_rg:
+                errs.append("• Passwords do not match.")
+            if errs:
+                st.error("Please fix the following:\n\n" + "\n\n".join(errs))
+            else:
+                existing = get_user_by_email(email_rg.strip().lower())
+                if existing is None:
+                    st.error("This email is not in the system. Ask an Admin to add you on the **Add User** screen.")
+                elif str(existing.password or "").strip() != "":
+                    st.error("This account is already configured. Please use **Sign in**.")
+                else:
+                    set_password_for_email(email_rg, pwd1_rg)
+                    # sign them in
+                    fresh = get_user_by_email(email_rg)
+                    st.session_state["auth_user"] = {
+                        "id": int(fresh.id),
+                        "name": fresh.user_name,
+                        "email": fresh.email,
+                        "user_type": fresh.user_type,
+                        "permanent": int(fresh.permanent),
+                    }
+                    st.success("Registration complete. Redirecting…")
+                    st.rerun()
+
 
 
 # -------------- UI --------------
@@ -735,35 +932,80 @@ st.set_page_config(page_title="Clients Admin", page_icon="👥", layout="wide")
 init_db()
 maybe_rollover_fees_for_today()
 
+if "auth_user" not in st.session_state:
+    if db_is_first_time():
+        render_first_time_setup()
+        st.stop()
+    else:
+        render_login_register()
+        st.stop()
+
 params = dict(st.query_params)
 current_page = params.get("page")
 
 st.title("Clients")
+if "auth_user" in st.session_state:
+    u = st.session_state["auth_user"]
+    top_l, top_r = st.columns([6,1])
+    with top_r:
+        st.caption(f"Signed in as **{u['name']}**")
+        if st.button("Log out", use_container_width=True):
+            for k in ("auth_user",):
+                st.session_state.pop(k, None)
+            st.rerun()
+now = time.time()
+last = st.session_state.get("last_activity", now)
+if now - last > IDLE_SECONDS:
+    # expire the session
+    st.session_state.pop("auth_user", None)
+    st.warning("Your session expired due to inactivity. Please sign in again.")
+    # show login/registration and stop
+    render_login_register()
+    st.stop()
+
 tabs = st.tabs(["🏠 Home", "🛠️ Admin"])
 
-# put this CSS once (e.g., near top of the detail page)
 st.markdown("""
 <style>
 /* make tab label text larger */
 div[data-testid="stTabs"] button p {
-    font-size: 1.1rem;        /* increase as desired (1.2rem, 18px, etc.) */
+    font-size: 1.2rem;        /* increase as desired (1.2rem, 18px, etc.) */
     font-weight: 600;         /* optional: make bold */
 }
-
+div[data-testid="stTextInput"] label p,
+div[data-testid="stSelectbox"] label p,
+div[data-testid="stDateInput"] label p,
+div[data-testid="stNumberInput"] label p,
+div[data-testid="stRadio"] label p {
+    font-size: 1.3rem !important;   /* increase label size */
+    font-weight: 600 !important;      /* make bold */
+}
 div[data-testid="stButton"] > button {
     white-space: nowrap !important;
-    min-width: 70px !important;   /* tweak as you like */
+    min-width: 72px !important;   /* tweak as you like */
     flex-shrink: 0 !important;
 }
-
-.client-name-cell {
-  display: flex;
-  justify-content: center;    /* centers horizontally */
-  align-items: center;        /* centers vertically */
-  height: 2.5rem;
-  text-align: center;         /* center multi-line text */
-  white-space: normal;        /* allow wrapping */
-  word-break: break-word;     /* wrap long names */
+div[data-baseweb="select"] input {
+            pointer-events: none !important;
+            caret-color: transparent !important;
+}
+div[data-baseweb="select"] input::placeholder {
+    color: transparent !important;
+}
+.header-style {
+    text-align: center !important;
+    font-weight: bold !important;
+    font-size: 1.3rem !important;
+    word-break: keep-all !important;
+    overflow-wrap: normal !important;
+}
+.value-style {
+    display: flex !important;
+    justify-content: center !important;
+    align-items: center !important;
+    height: 2.5rem;
+    text-align: center !important;
+    font-size: 1.15rem !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -774,58 +1016,72 @@ with tabs[0]:
     page = current_page if current_page in home_pages else "home_main"
 
     if page == "home_main":
-        st.subheader("Client List")
+        st.session_state.setdefault("home_sort_by", "Processing Date")
+        st.session_state.setdefault("home_sort_dir", "Descending")
+        st.session_state["show_all_txns"] = False
+        left, right = st.columns([2.6, 1])
+        left.markdown("## Client List")
 
         if not check_active_clients():
-            if st.session_state.pop("terminated_msg", False):
-                st.success("Client Terminated. No active clients. Ask an Admin to assign one.")
+            if st.session_state.get("terminated_msg"):
+                c_name = st.session_state["terminated_msg"]
+                st.session_state.pop("terminated_msg")
+                st.success(f"**{c_name}** is terminated. No active clients.")
             else:
                 st.info("No active clients. Ask an Admin to assign one.")
         else:
-            if st.session_state.pop("terminated_msg", False):
-                st.success("Client Terminated.")
+            if st.session_state.get("terminated_msg"):
+                c_name = st.session_state["terminated_msg"]
+                st.session_state.pop("terminated_msg")
+                st.success(f"**{c_name}** is terminated.")
+                fade_message()
+            if st.session_state.get("edited_client"):
+                c_name = st.session_state["edited_client"]
+                st.session_state.pop("edited_client")
+                st.success(f"**{c_name}** updated successfully.")
                 fade_message()
             
-            c_sort, c_dir = st.columns([3, 1])
-            with c_sort:
+            st.markdown("""<style> div[data-testid="stSelectbox"] { min-width: 170px !important; }
+                        div[data-testid="stRadio"] label { white-space: nowrap; } </style> """, unsafe_allow_html=True)
+            with right:
                 sort_cols = ["Client Name", "Assigned User", "Pay Frequency", "Processing Date", "Pay Date"]
-                sort_label = st.selectbox("Sort by", sort_cols, index=0)
-            with c_dir:
-                dir_label = st.radio("Direction", ["Ascending", "Descending"], index=0, horizontal=True)
+                sort_choice = st.selectbox("Sort by", sort_cols, 
+                                           index=sort_cols.index(st.session_state["home_sort_by"]), key="home_sort_choice")
+                direction = st.radio(" ", ["Ascending", "Descending"], index=0 if st.session_state["home_sort_dir"] =="Ascending" else 1,
+                                     key="home_dir_choice", horizontal=True, label_visibility="collapsed")
 
-            order_by = sort_label
-            ascending = (dir_label == "Ascending")
-
-            df = show_clients(False, order_by=order_by, ascending=ascending)
+            df = show_clients(False, order_by=sort_choice, ascending=True if direction == "Ascending" else False)
             
-            arrow = " ▲" if ascending else " ▼"
+            arrow = "▲" if direction == "Ascending" else "▼"
             def hdr_txt(key):
-                return f"{key}{arrow}" if order_by == key else key
+                return f"{key} {arrow}" if sort_choice == key else key
 
-            header = st.columns((1, 4, 1.5, 1.5, 1.5, 1.5), gap="small")
-            header_style = "text-align:center; font-weight:bold; text-align: center;"
-            header[1].markdown(f"<p style='{header_style}'>{hdr_txt('Client Name')}</p>", unsafe_allow_html=True)
-            header[2].markdown(f"<p style='{header_style}'>{hdr_txt('Assigned User')}</p>", unsafe_allow_html=True)
-            header[3].markdown(f"<p style='{header_style}'>{hdr_txt('Pay Frequency')}</p>", unsafe_allow_html=True)
-            header[4].markdown(f"<p style='{header_style}'>{hdr_txt('Processing Date')}</p>", unsafe_allow_html=True)
-            header[5].markdown(f"<p style='{header_style}'>{hdr_txt('Pay Date')}</p>", unsafe_allow_html=True)
+            header = st.columns((1, 3, 1.5, 1.5, 1.5, 1.5), gap="small")
+            header[1].markdown(f"<p class='header-style'>{hdr_txt('Client Name')}</p>", unsafe_allow_html=True)
+            header[2].markdown(f"<p class='header-style'>{hdr_txt('Assigned User')}</p>", unsafe_allow_html=True)
+            header[3].markdown(f"<p class='header-style'>{hdr_txt('Pay Frequency')}</p>", unsafe_allow_html=True)
+            header[4].markdown(f"<p class='header-style'>{hdr_txt('Processing Date')}</p>", unsafe_allow_html=True)
+            header[5].markdown(f"<p class='header-style'>{hdr_txt('Pay Date')}</p>", unsafe_allow_html=True)
             
             for _, row in df.iterrows():
-                cols = st.columns((1, 4, 1.5, 1.5, 1.5, 1.5), gap="small")
-                style_css = "display:flex; justify-content:center; align-items:center; height:2.5rem; text-align: center;"
+                cols = st.columns((1, 3, 1.5, 1.5, 1.5, 1.5), gap="small")
 
-                icon = "⚠️" if (date.fromisoformat(row["fee_increase_effective_date"]) - date.today()).days <= 30 else None
+                eff_date = date.fromisoformat(row["fee_increase_effective_date"])
+                icon = "⚠️" if (eff_date - date.today()).days <= 30 else None
                 if cols[0].button("View", key=f"view_{int(row['id'])}", width='stretch', icon=icon):
                     set_page("home_detail", id=int(row["id"]))
                     st.rerun()
-                
-                cols[1].markdown(f"<p style='{style_css}'>{row['client_name']}</p>", unsafe_allow_html=True)
-                cols[2].markdown(f"<p style='{style_css}'>{row['assigned_user_name']}</p>", unsafe_allow_html=True)
-                cols[3].markdown(f"<p style='{style_css}'>{row['pay_frequency']}</p>", unsafe_allow_html=True)
+                if cols[0].button("Edit", key=f"edit_{int(row['id'])}", width='stretch', icon="✏️"):
+                    set_page("home_edit", id=int(row["id"]))
+                    st.rerun()
+                custom_height = "style='height: 6rem'"
+                cols[1].markdown(f"<div class='value-style' {custom_height}>{row['client_name']}</div>", unsafe_allow_html=True)
+                cols[2].markdown(f"<p class='value-style' {custom_height}>{row['assigned_user_name']}</p>", unsafe_allow_html=True)
+                cols[3].markdown(f"<p class='value-style' {custom_height}>{row['pay_frequency']}</p>", unsafe_allow_html=True)
                 processing_format = date.fromisoformat(str(row['processing_date'])).strftime('%b %d, %Y')
-                cols[4].markdown(f"<p style='{style_css}'>{processing_format}</p>", unsafe_allow_html=True)
+                cols[4].markdown(f"<p class='value-style' {custom_height}>{processing_format}</p>", unsafe_allow_html=True)
                 pay_date_format = date.fromisoformat(str(row['pay_date'])).strftime('%b %d, %Y')
-                cols[5].markdown(f"<p style='{style_css}'>{pay_date_format}</p>", unsafe_allow_html=True)
+                cols[5].markdown(f"<p class='value-style' {custom_height}>{pay_date_format}</p>", unsafe_allow_html=True)
                 st.markdown("<hr style='margin: 0.0rem 0;'>", unsafe_allow_html=True)
 
 
@@ -834,17 +1090,17 @@ with tabs[0]:
         client_id = int(raw[0]) if isinstance(raw, list) else int(raw)
         this_client = fetch_row("clients", client_id)
 
-        if st.session_state.pop("edited_client", False):
-            st.success("Client updated successfully.")
-            fade_message()
+        st.session_state.setdefault("detail_sort_by", "Processing Date")
+        st.session_state.setdefault("detail_sort_dir", "Descending")
+
         if st.session_state.pop("reg_period", False):
-            st.success("New pay period successfully entered.")
+            st.success("New pay period entered.")
             fade_message()
         if st.session_state.pop("add_period", False):
-            st.success("Additional pay period successfully entered.")
+            st.success("Additional pay period entered.")
             fade_message()
         if st.session_state.pop("edited_txn", False):
-            st.success("Pay Period updated successfully.")
+            st.success("Pay Period successfully updated.")
             fade_message()
 
         if st.button("← Back"):
@@ -853,96 +1109,118 @@ with tabs[0]:
 
         st.markdown(f"## {this_client.client_name}")
 
-        c1, c2, c3, c4 = st.columns(4)
-        if c1.button("Edit Client", width='stretch'):
-            set_page("home_edit", id=client_id)
-            st.rerun()
-        if c2.button("Regular pay period", width='stretch'):
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Regular pay period", width='stretch'):
             set_page("new_period", id=client_id, type="regular")
             st.rerun()
-        if c3.button("Additional pay period", width='stretch'):
+        if c2.button("Additional pay period", width='stretch'):
             set_page("new_period", id=client_id, type="additional")
             st.rerun()
-        if c4.button("❌ Terminate", width='stretch'):
+        if c3.button("❌ Terminate", width='stretch'):
             total_net = get_client_net_amount(client_id)
             if total_net > 0:
                 cannot_terminate_dialog(this_client.client_name, total_net)
             else:
                 confirm_terminate_dialog(client_id, this_client.client_name)
 
-        tx_df = get_client_payments(client_id, "processing_date")
-        if not tx_df.empty:
-            st.markdown("<br><br>", unsafe_allow_html=True)
-            st.markdown("### Payment History")
+        if check_payment_history(client_id):
+            st.markdown("---")
 
+            left, right = st.columns([2.6, 1])
+            left.markdown("## Payment History")
+
+            st.markdown("""<style> div[data-testid="stSelectbox"] { min-width: 170px !important; }
+                        div[data-testid="stRadio"] label { white-space: nowrap; } </style> """, unsafe_allow_html=True)
+            
+            with right:
+                sort_cols = ["Payment Type", "Start Date", "End Date", "Processing Date", "Cost"]
+                sort_choice = st.selectbox("Sort by", sort_cols, 
+                                           index=sort_cols.index(st.session_state["detail_sort_by"]), key="detail_sort_choice")
+                direction = st.radio(" ", ["Ascending", "Descending"], key="detail_dir_choice", horizontal=True, 
+                                     index=0 if st.session_state["detail_sort_dir"] =="Ascending" else 1,
+                                     label_visibility="collapsed")
+
+            tx_df = get_client_payments(client_id, order_by=sort_choice, ascending=(direction == "Ascending"))
+
+            arrow = "▲" if direction == "Ascending" else "▼"
+            def hdr_txt(key):
+                return f"{key} {arrow}" if sort_choice == key else key
+            
             show_all = st.session_state.get("show_all_txns", False)
             tx_display = tx_df if show_all else tx_df.head(5)
 
-            header = st.columns((0.8, 2, 2, 2, 2, 2), gap="small")
-            header[1].markdown("<p style='text-align:center; font-weight:bold;'>Period Type</p>", unsafe_allow_html=True)
-            header[2].markdown("<p style='text-align:center; font-weight:bold;'>Start Date</p>", unsafe_allow_html=True)
-            header[3].markdown("<p style='text-align:center; font-weight:bold;'>End Date</p>", unsafe_allow_html=True)
-            header[4].markdown("<p style='text-align:center; font-weight:bold;'>Processed Date</p>", unsafe_allow_html=True)
-            header[5].markdown("<p style='text-align:center; font-weight:bold;'>Cost</p>", unsafe_allow_html=True)
+            header = st.columns((1, 2.4, 2, 2, 2, 2), gap="small")
+            header[1].markdown(f"<p class='header-style'>{hdr_txt('Payment Type')}</p>", unsafe_allow_html=True)
+            header[2].markdown(f"<p class='header-style'>{hdr_txt('Start Date')}</p>", unsafe_allow_html=True)
+            header[3].markdown(f"<p class='header-style'>{hdr_txt('End Date')}</p>", unsafe_allow_html=True)
+            header[4].markdown(f"<p class='header-style'>{hdr_txt('Processing Date')}</p>", unsafe_allow_html=True)
+            header[5].markdown(f"<p class='header-style'>{hdr_txt('Cost')}</p>", unsafe_allow_html=True)
             
             for _, row in tx_display.iterrows():
-                cols = st.columns((0.8, 2, 2, 2, 2, 2), gap="small")
-                style_css = "display:flex; justify-content:center; align-items:center; height:2.5rem;"
+                cols = st.columns((1, 2.4, 2, 2, 2, 2), gap="small")
 
                 if cols[0].button("Edit", key=f"edit_{int(row['id'])}", width='stretch', icon="✏️"):
-                    set_page("txn_edit", id=client_id, txn_id=int(row['id']))
+                    set_page("txn_edit", txn_id=int(row['id']))
                     st.rerun()
 
-                cols[1].markdown(f"<p style='{style_css}'>{row['period_type']}</p>", unsafe_allow_html=True)
+                cols[1].markdown(f"<p class='value-style'>{row['period_type']}</p>", unsafe_allow_html=True)
                 start_date_format = date.fromisoformat(str(row['pay_start_date'])).strftime('%b %d, %Y')
-                cols[2].markdown(f"<p style='{style_css}'>{start_date_format}</p>", unsafe_allow_html=True)
+                cols[2].markdown(f"<p class='value-style'>{start_date_format}</p>", unsafe_allow_html=True)
                 end_date_format = date.fromisoformat(str(row['pay_end_date'])).strftime('%b %d, %Y')
-                cols[3].markdown(f"<p style='{style_css}'>{end_date_format}</p>", unsafe_allow_html=True)
+                cols[3].markdown(f"<p class='value-style'>{end_date_format}</p>", unsafe_allow_html=True)
                 processing_format = date.fromisoformat(str(row['processing_date'])).strftime('%b %d, %Y')
-                cols[4].markdown(f"<p style='{style_css}'>{processing_format}</p>", unsafe_allow_html=True)
-                cols[5].markdown(f"<p style='{style_css}'>{'${:,.2f}'.format(float(row['cost']))}</p>", unsafe_allow_html=True)
+                cols[4].markdown(f"<p class='value-style'>{processing_format}</p>", unsafe_allow_html=True)
+                cols[5].markdown(f"<p class='value-style'>{'${:,.2f}'.format(float(row['cost']))}</p>", unsafe_allow_html=True)
                 st.markdown("<hr style='margin: 0.0rem 0;'>", unsafe_allow_html=True)
 
             if len(tx_df) > 5:
                 label = "Show Less" if show_all else "Show More"
                 left, center, right = st.columns([2, 1, 2])
                 with center:
-                    if st.button(label, width='stretch', key="toggle_txn_table", ):
+                    if st.button(label, width='stretch', key="toggle_txn_table"):
                         st.session_state["show_all_txns"] = not show_all
                         st.rerun()
     
     elif page == "home_edit":
         st.markdown("### Edit Client")
+
+        if "edit_errors" not in st.session_state:
+            st.session_state["edit_errors"] = {}
+
         raw = params.get("id")
         client_id = int(raw[0]) if isinstance(raw, list) else int(raw)
         row = fetch_row("clients", client_id)
 
         n1, n2 = st.columns(2)
         name = n1.text_input("Client Name*", value=row.client_name, key=f"edit_name_{client_id}")
+        if msg := get_err("edit_errors", "show_name_error"): n1.error(msg)
         users_df = get_users(["id", "user_name", "user_type"])
         users_df["combined"] = (users_df["user_name"] + " (" + users_df["user_type"] + ")")
-        user_idx = int(users_df.index[users_df["id"] == row.assigned_user_id][0]) + 1
-        assigned_user = n2.selectbox("Assigned User", ["None"] + users_df["combined"].tolist(), index = user_idx)
+        user_idx = int(users_df.index[users_df["id"] == row.assigned_user_id][0])
+        assigned_user = n2.selectbox("Assigned User", users_df["combined"].tolist(), index = user_idx)
 
         a1, a2, a3 = st.columns(3)
         pay_frequency = a1.selectbox("Pay Frequency*", PAY_FREQ, index=PAY_FREQ.index(row.pay_frequency))
         pay_start_date = a2.date_input("Pay Start Date*", value=date.fromisoformat(row.pay_start_date), format="MM/DD/YYYY")
+        if msg := get_err("edit_errors", "show_start_dt_error"): a2.error(msg)
         next_date = advance_pay_start_date(pay_start_date, pay_frequency) if pay_start_date else None
         pay_end_date = a3.date_input("Pay end Date*", disabled=True, value=next_date - timedelta(days=1) if next_date else None, format="MM/DD/YYYY")
         
         b1, b2 = st.columns(2)
         processing_date = b1.date_input("Processing Date*", value=date.fromisoformat(row.processing_date), format="MM/DD/YYYY")
+        if msg := get_err("edit_errors", "show_process_dt_error"): b1.error(msg)
         pay_date = b2.date_input("Pay Date*", value=date.fromisoformat(row.pay_date), format="MM/DD/YYYY")
+        if msg := get_err("edit_errors", "show_pay_dt_error"): b2.error(msg)
 
         c1, c2, c3 = st.columns(3)
         base_fee = c1.number_input("Base Fee*", min_value=1.0, step=1.0, format="%.2f", value=float(row.base_fee))
-        num_states = c2.number_input("Number of States in Base Fee*", min_value=0, step=1, value=int(row.num_states_in_base_fee))
+        num_states = c2.number_input("Number of States in Base Fee*", min_value=0, step=1, max_value=1, value=int(row.num_states_in_base_fee))
         num_employees = c3.number_input("Number of Employees in Base Fee*", min_value=0, step=1, value=int(row.num_employees_in_base_fee))
 
         d1, d2 = st.columns(2)
         add_state_fee = d1.number_input("Additional State Fee*", min_value=1.0, step=1.0, format="%.2f", value=float(row.add_state_fee))
         add_emp_fee = d2.number_input("Additional Employee Fee*", min_value=1.0, step=1.0, format="%.2f", value=float(row.add_employee_fee))
-        
+
         method = st.radio("Fee Increase Choice", options=["% Increase", "Manually Change Fee"], horizontal=True,
                           index=0 if row.use_pct_increase == 1 else 1)
         if method == "% Increase":
@@ -950,13 +1228,14 @@ with tabs[0]:
             e1, e2 = st.columns(2)
             inc_pct = e1.number_input("Fee increase %*", min_value=1.0, step=1.0, format="%.2f", value=float(row.fee_increase_pct))
             eff_date = e2.date_input("Effective Date*", value=date.fromisoformat(row.fee_increase_effective_date), format="MM/DD/YYYY")
-            inc_base_override = float(row.incr_base_fee)  # not used when % method is selected
+            if msg := get_err("edit_errors", "show_eff_dt_error"): e2.error(msg)
+            inc_base_override = float(row.incr_base_fee)
             inc_state_override = float(row.incr_add_state_fee)
             inc_emp_override = float(row.incr_add_employee_fee)
             
         else:
             use_pct_increase = 0
-            inc_pct = float(row.fee_increase_pct) # not used when manual change is selected
+            inc_pct = float(row.fee_increase_pct)
             w, x, y = st.columns(3)
             inc_base_override = w.number_input("New Base Fee*", min_value=1.0, step=1.0, format="%.2f", value=float(row.incr_base_fee))
             inc_state_override = x.number_input("New Additional State Fee*", min_value=1.0, step=1.0, format="%.2f", 
@@ -964,62 +1243,61 @@ with tabs[0]:
             inc_emp_override = y.number_input("New Additional Employee Fee*", min_value=1.0, step=1.0, format="%.2f", 
                                               value=float(row.incr_add_employee_fee))
             eff_date = st.date_input("Effective Date*", value=date.fromisoformat(row.fee_increase_effective_date), format="MM/DD/YYYY")
-        
+            if msg := get_err("edit_errors", "show_eff_dt_error"): st.error(msg)
+
         register_choice = st.radio("Payroll Registration?", options=["Yes", "No"], horizontal=True, 
                                    index=0 if row.payroll_registration == 1 else 1)
         if register_choice == "Yes": 
             register_fee = st.number_input("Registration Fee*", min_value=0.0, step=1.0, format="%.2f", value=float(row.registration_fee))
+            if msg := get_err("edit_errors", "show_reg_fee_error"): st.error(msg)
         else:
             register_fee = 0.0
         
-        a,b = st.columns([1, 1])
+        a,b = st.columns(2)
         save_clicked = a.button("💾 Save changes", type="primary", key=f"edit_save_{client_id}", width='stretch')
         cancel_clicked = b.button("Cancel", key=f"edit_cancel_{client_id}", width='stretch')
 
         if cancel_clicked:
-            set_page("home_detail", id=client_id)
+            st.session_state["edit_errors"] = {}
+            set_page("home_main")
             st.rerun()
 
         if save_clicked:
-            errors = []
             if not name.strip():
-                errors.append("• Client Name is required.")
-            if assigned_user == "None":
-                errors.append("• Must assign a user to this client.")
-            if pay_start_date is None:
-                errors.append("• Pay start date is required.")
+                st.session_state["edit_errors"]["show_name_error"] = "Client Name is required"
+            else: st.session_state["edit_errors"].pop("show_name_error", None)
+            latest_end = get_latest_pay_end_date(client_id)
+            if latest_end and pay_start_date <= latest_end:
+                msg = f"• Pay start date must be after the end date of the latest period ({latest_end.isoformat()})."
+                st.session_state["edit_errors"]["show_start_dt_error"] = msg
             else:
-                latest_end = get_latest_pay_end_date(client_id)
-                if latest_end and pay_start_date <= latest_end:
-                    errors.append(f"• Pay start date must be after the latest pay end date ({latest_end.isoformat()}).")
                 ok, msg = validate_start_date(pay_frequency, pay_start_date)
                 if not ok:
-                    errors.append(f"• {msg}")
-            if processing_date is None:
-                errors.append("• Processing Date is required.")
-            elif pay_end_date and processing_date < pay_end_date:
-                errors.append("• Processing Date must be on/after Pay End Date.")
-            if pay_date is None:
-                errors.append("• Pay Date is required.")
-            elif processing_date and pay_date < processing_date:
-                errors.append("• Pay Date must be on/after Processing Date.")
-            if eff_date is None:
-                errors.append("• Fee Increase Effective Date is required.")
-            elif eff_date <= date.today():
-                errors.append("• Fee Increase Effective Date must be after today.")
+                    st.session_state["edit_errors"]["show_start_dt_error"] = msg
+                else: st.session_state["edit_errors"].pop("show_start_dt_error", None)
+            
+            if pay_end_date and processing_date < pay_end_date:
+                st.session_state["edit_errors"]["show_process_dt_error"] = "Processing Date must be on/after Pay End Date"
+            else: st.session_state["edit_errors"].pop("show_process_dt_error", None)
+            if pay_date < processing_date:
+                st.session_state["edit_errors"]["show_pay_dt_error"] = "Pay Date must be on/after Processing Date"
+            else: st.session_state["edit_errors"].pop("show_pay_dt_error", None)
+            if eff_date <= date.today():
+                st.session_state["edit_errors"]["show_eff_dt_error"] = "Fee Increase Effective Date must be after today"
+            else: st.session_state["edit_errors"].pop("show_eff_dt_error", None)
 
             reg_bool = (register_choice == "Yes")
-            if reg_bool and register_fee <= 0: errors.append("• Registration Fee must be > 0.")
+            if reg_bool and register_fee <= 0: 
+                st.session_state["edit_errors"]["show_reg_fee_error"] = "Registration Fee must be > 0"
+            else: st.session_state["edit_errors"].pop("show_reg_fee_error", None)
             
-            if errors:
-                st.error("Please fix the following before saving:\n\n" + "\n\n".join(errors))
+            if st.session_state["edit_errors"]:
+                st.rerun()
             else:
                 assigned_user_id = users_df.loc[users_df["combined"] == assigned_user, "id"].iloc[0]
-                assigned_user_name = users_df.loc[users_df["combined"] == assigned_user, "user_name"].iloc[0]
                 client_info = {
                     "client_name": name.strip().upper(),
                     "assigned_user_id": int(assigned_user_id),
-                    "assigned_user_name": assigned_user_name, 
                     "pay_frequency": pay_frequency, 
                     "pay_start_date": pay_start_date.isoformat(),
                     "processing_date": processing_date.isoformat(),
@@ -1046,8 +1324,9 @@ with tabs[0]:
                     client_info["incr_add_employee_fee"] = round(float(inc_emp_override), 2)
 
                 update_entry("clients", client_id, client_info)
-                st.session_state["edited_client"] = True
-                set_page("home_detail", id=client_id)
+                st.session_state["edited_client"] = client_info["client_name"]
+                st.session_state["edit_errors"] = {}
+                set_page("home_main")
                 st.rerun()
     
     # ---------- NEW PAY PERIOD SCREEN ----------
@@ -1062,11 +1341,9 @@ with tabs[0]:
     # ---------- TRANSACTION EDIT SCREEN ----------
     elif page == "txn_edit":
         raw_txn = params.get("txn_id")
-        raw_client = params.get("id")
         txn_id = int(raw_txn[0]) if isinstance(raw_txn, list) else int(raw_txn)
-        client_id = int(raw_client[0]) if isinstance(raw_client, list) else int(raw_client)
         
-        render_edit_period(client_id, txn_id)
+        render_edit_period(txn_id)
 
 
 # ========== ADMIN TAB ==========
@@ -1075,18 +1352,24 @@ with tabs[1]:
     page = current_page if current_page in admin_pages else "admin_main"
 
     if page == "admin_main":
-        st.subheader("Admin")
+        st.session_state.setdefault("admin_sort_by", "Amount Receivable")
+        st.session_state.setdefault("admin_sort_dir", "Descending")
+
+        st.markdown("## Admin")
+        
         if st.session_state.pop("new_client", False):
-            st.success("Client created successfully.")
+            st.success("New client created.")
             fade_message()
         if st.session_state.pop("new_user", False):
-            st.success("New Payroll User created successfully.")
+            st.success("New payroll User created.")
             fade_message()
         if st.session_state.pop("users_saved", False):
-            st.success("Users info updated.")
+            st.success("Users info was updated.")
             fade_message()
-        if st.session_state.pop("collections_saved", False):
-            st.success("Collection details updated.")
+        if st.session_state.get("collections_saved"):
+            c_name = st.session_state["collections_saved"]
+            st.session_state.pop("collections_saved")
+            st.success(f"Accounts Receivable for **{c_name}** were updated.")
             fade_message()
 
         a, b, c = st.columns(3)
@@ -1111,128 +1394,160 @@ with tabs[1]:
             set_page("user_view")
             st.rerun()
 
-        agg = get_payment_aggregates()
-        if not agg.empty:
+        if check_active_clients():
             st.markdown("---")
-            st.markdown("### Accounts Receivable")
+            left, right = st.columns([2.6, 1])
+            left.markdown("### Accounts Receivable")
+
+            st.markdown("""<style> div[data-testid="stSelectbox"] { min-width: 190px !important; }
+                        div[data-testid="stRadio"] label { white-space: nowrap; } </style> """, unsafe_allow_html=True)
+            with right:
+                sort_cols = ["Client Name", "Total Fee", "Amount Collected", "Amount Receivable"]
+                sort_choice = st.selectbox("Sort by", sort_cols, 
+                                           index=sort_cols.index(st.session_state["admin_sort_by"]), key="admin_sort_choice")
+                direction = st.radio(" ", ["Ascending", "Descending"], index=0 if st.session_state["admin_sort_dir"] =="Ascending" else 1,
+                                     key="admin_dir_choice", horizontal=True, label_visibility="collapsed")
+            
+            agg_df = get_payment_aggregates(order_by=sort_choice, ascending=(direction == "Ascending"))
+
+            arrow = "▲" if direction == "Ascending" else "▼"
+            def hdr_txt(key):
+                return f"{key} {arrow}" if sort_choice == key else key
 
             header = st.columns((1, 2, 2, 2, 2), gap="small")
-            header[1].markdown("<p style='text-align:center; font-weight:bold;'>Client Name</p>", unsafe_allow_html=True)
-            header[2].markdown("<p style='text-align:center; font-weight:bold;'>Total Fee</p>", unsafe_allow_html=True)
-            header[3].markdown("<p style='text-align:center; font-weight:bold;'>Amount Collected</p>", unsafe_allow_html=True)
-            header[4].markdown("<p style='text-align:center; font-weight:bold;'>Amount Receivable</p>", unsafe_allow_html=True)
+            header[1].markdown(f"<p class='header-style'>{hdr_txt('Client Name')}</p>", unsafe_allow_html=True)
+            header[2].markdown(f"<p class='header-style'>{hdr_txt('Total Fee')}</p>", unsafe_allow_html=True)
+            header[3].markdown(f"<p class='header-style'>{hdr_txt('Amount Collected')}</p>", unsafe_allow_html=True)
+            header[4].markdown(f"<p class='header-style'>{hdr_txt('Amount Receivable')}</p>", unsafe_allow_html=True)
 
-            for _, r in agg.iterrows():
+            for _, r in agg_df.iterrows():
                 cols = st.columns((1, 2, 2, 2, 2), gap="small")
-                style_css = "display:flex; justify-content:center; align-items:center; height:2.5rem;"
 
                 if cols[0].button("View", key=f"collection_{int(r['client_id'])}"):
                     set_page("admin_collect", id=int(r["client_id"]))
                     st.rerun()
 
-                cols[1].markdown(f"<p style='{style_css}'>{r['client_name']}</p>", unsafe_allow_html=True)
-                cols[2].markdown(f"<p style='{style_css}'>${float(r['total_cost']):,.2f}</p>", unsafe_allow_html=True)
-                cols[3].markdown(f"<p style='{style_css}'>${float(r['total_collected']):,.2f}</p>", unsafe_allow_html=True)
-                cols[4].markdown(f"<p style='{style_css}'>${float(r['net_amount']):,.2f}</p>", unsafe_allow_html=True)
+                cols[1].markdown(f"<p <p class='value-style'>{r['client_name']}</p>", unsafe_allow_html=True)
+                cols[2].markdown(f"<p <p class='value-style'>${float(r['total_cost']):,.2f}</p>", unsafe_allow_html=True)
+                cols[3].markdown(f"<p <p class='value-style'>${float(r['total_collected']):,.2f}</p>", unsafe_allow_html=True)
+                cols[4].markdown(f"<p <p class='value-style'>${float(r['net_amount']):,.2f}</p>", unsafe_allow_html=True)
                 st.markdown("<hr style='margin: 0.0rem 0;'>", unsafe_allow_html=True)
     
     
     elif page == "admin_add":
         st.markdown("### New Client")
 
-        st.markdown("""
-        <style>
-        div[data-testid="stTextInput"] > label > div:first-child,
-        div[data-testid="stSelectbox"] > label > div:first-child,
-        div[data-testid="stDateInput"] > label > div:first-child,
-        div[data-testid="stNumberInput"] > label > div:first-child,
-        div[data-testid="stRadio"] > label > div:first-child {
-            font-size: 1.15rem !important;    /* increase font size */
-            font-weight: 600 !important;      /* make bold */
-        }
-        </style>
-        """, unsafe_allow_html=True)
+        if "admin_errors" not in st.session_state:
+            st.session_state["admin_errors"] = {}
 
         n1, n2 = st.columns(2)
         name = n1.text_input("Client Name*",key="client_name", value=None)
+        if msg := get_err("admin_errors", "show_name_error"): n1.error(msg)
         users_df = get_users(["id", "user_name", "user_type"])
         users_df["combined"] = (users_df["user_name"] + " (" + users_df["user_type"] + ")")
         assigned_user = n2.selectbox("Assigned User", ["None"] + users_df["combined"].tolist(), index = 0)
+        if msg := get_err("admin_errors", "show_user_error"): n2.error(msg)
 
         a1, a2, a3 = st.columns(3)
-        pay_frequency = a1.selectbox("Pay frequency*", PAY_FREQ, index=0)
+        pay_frequency = a1.selectbox("Pay Frequency*", PAY_FREQ, index=0)
         pay_start_date = a2.date_input("Pay Start Date*", value=None, format="MM/DD/YYYY")
+        if msg := get_err("admin_errors", "show_start_dt_error"): a2.error(msg)
         next_date = advance_pay_start_date(pay_start_date, pay_frequency) if pay_start_date else None
-        pay_end_date = a3.date_input("Pay end Date*", disabled=True, value=next_date - timedelta(days=1) if next_date else None, format="MM/DD/YYYY")
+        pay_end_date = a3.date_input("Pay end Date*", disabled=True, help="Only shown as reference for Processing/Pay Dates",
+                                     value=next_date - timedelta(days=1) if next_date else None, format="MM/DD/YYYY")
         
         b1, b2 = st.columns(2)
         processing_date = b1.date_input("Processing Date*", value=None, format="MM/DD/YYYY")
+        if msg := get_err("admin_errors", "show_process_dt_error"): b1.error(msg)
         pay_date = b2.date_input("Pay Date*", value=None, format="MM/DD/YYYY")
+        if msg := get_err("admin_errors", "show_pay_dt_error"): b2.error(msg)
 
         c1, c2, c3 = st.columns(3)
         base_fee = c1.number_input("Base Fee*", min_value=1.0, step=1.0, format="%.2f", value=None)
-        num_states = c2.number_input("Number of States in Base Fee*", min_value=0, step=1, value=None)
+        if msg := get_err("admin_errors", "show_bf_error"): c1.error(msg)
+        num_states = c2.number_input("Number of States in Base Fee*", min_value=0, step=1, value=None, max_value=1)
+        if msg := get_err("admin_errors", "show_bf_st_error"): c2.error(msg)
         num_employees = c3.number_input("Number of Employees in Base Fee*",  min_value=0, step=1, value=None)
+        if msg := get_err("admin_errors", "show_bf_ee_error"): c3.error(msg)
 
         d1, d2, d3 = st.columns(3)
         add_state_fee = d1.number_input("Additional State Fee*", min_value=1.0, step=1.0, format="%.2f", value=None)
+        if msg := get_err("admin_errors", "show_add_st_error"): d1.error(msg)
         add_emp_fee = d2.number_input("Additional Employee Fee*", min_value=1.0, step=2.0, format="%.2f", value=None)
+        if msg := get_err("admin_errors", "show_add_ee_error"): d2.error(msg)
         inc_pct = d3.number_input("Fee increase %*", min_value=1.0, step=1.0, format="%.2f", value=None)
+        if msg := get_err("admin_errors", "show_pct_error"): d3.error(msg)
 
         register_choice = st.radio("Payroll Registration?", options=["Yes", "No"], horizontal=True, index=1)
         if register_choice == "Yes":
             register_fee = st.number_input("Registration Fee*", min_value=0.0, step=1.0, format="%.2f", value=None)
+            if msg := get_err("admin_errors", "show_reg_fee_error"): st.error(msg)
         else:
             register_fee = 0.00
 
-        a_col, b_col = st.columns([1, 1])
+        a_col, b_col = st.columns(2)
         create_clicked = a_col.button("Create Client", type="primary", width='stretch')
         cancel_clicked = b_col.button("Cancel", width='stretch')
 
         if cancel_clicked:
+            st.session_state["admin_errors"] = {}
             set_page("admin_main")
             st.rerun()
 
         if create_clicked:
-            errors = []
-            if not name:
-                errors.append("• Client Name is required.")
+            if not name.strip():
+                st.session_state["admin_errors"]["show_name_error"] = "Client Name is required"
+            else: st.session_state["admin_errors"].pop("show_name_error", None)
             if assigned_user == "None":
-                errors.append("• Must assign a user to this client.")
+                st.session_state["admin_errors"]["show_user_error"] = "Must assign a user"
+            else: st.session_state["admin_errors"].pop("show_user_error", None)
             if pay_start_date is None:
-                errors.append("• Pay Start Date is required.")
+                st.session_state["admin_errors"]["show_start_dt_error"] = "Pay Start Date is required"
             else:
                 ok, msg = validate_start_date(pay_frequency, pay_start_date)
                 if not ok:
-                    errors.append(f"• {msg}")
+                    st.session_state["admin_errors"]["show_start_dt_error"] = msg
+                else: st.session_state["admin_errors"].pop("show_start_dt_error", None)
             if processing_date is None:
-                errors.append("• Processing Date is required.")
+                st.session_state["admin_errors"]["show_process_dt_error"] = "Processing Date is required"
             elif pay_end_date and processing_date < pay_end_date:
-                errors.append("• Processing Date must be on/after Pay End Date.")
+                st.session_state["admin_errors"]["show_process_dt_error"] = "Processing Date must be on/after Pay End Date"
+            else: st.session_state["admin_errors"].pop("show_process_dt_error", None)
             if pay_date is None:
-                errors.append("• Pay Date is required.")
+                st.session_state["admin_errors"]["show_pay_dt_error"] = "Pay Date is required"
             elif processing_date and pay_date < processing_date:
-                errors.append("• Pay Date must be on/after Processing Date.")
-            
-            if base_fee is None: errors.append("• Base Fee must be a number > 0.")
-            if num_states is None: errors.append("• Number of states in base fee must be a number >= 0.")
-            if num_employees is None: errors.append("• Number of employees in base fee must be a number >= 0.")
-            if add_state_fee is None: errors.append("• Additional state fee must be a number > 0.")
-            if add_emp_fee is None: errors.append("• Additional employee fee must be a number > 0.")
-            if inc_pct is None: errors.append("• Fee Increase % must be a number > 0.")
-
+                st.session_state["admin_errors"]["show_pay_dt_error"] = "Pay Date must be on/after Processing Date"
+            else: st.session_state["admin_errors"].pop("show_pay_dt_error", None)
+            if base_fee is None:
+                st.session_state["admin_errors"]["show_bf_error"] = "Base Fee must b > 0"
+            else: st.session_state["admin_errors"].pop("show_bf_error", None)
+            if num_states is None:
+                st.session_state["admin_errors"]["show_bf_st_error"] = "Number of included states must be >= 0"
+            else: st.session_state["admin_errors"].pop("show_bf_st_error", None)
+            if num_employees is None:
+                st.session_state["admin_errors"]["show_bf_ee_error"] = "Number of included employees must be >= 0"
+            else: st.session_state["admin_errors"].pop("show_bf_ee_error", None)
+            if add_state_fee is None:
+                st.session_state["admin_errors"]["show_add_st_error"] = "Additional state fee must be > 0"
+            else: st.session_state["admin_errors"].pop("show_add_st_error", None)
+            if add_emp_fee is None:
+                st.session_state["admin_errors"]["show_add_ee_error"] = "Additional employee fee must be > 0"
+            else: st.session_state["admin_errors"].pop("show_add_ee_error", None)
+            if inc_pct is None:
+                st.session_state["admin_errors"]["show_pct_error"] = "Fee Increase % must be > 0"
+            else: st.session_state["admin_errors"].pop("show_pct_error", None)
             reg_bool = (register_choice == "Yes")
-            if reg_bool and register_fee <= 0: errors.append("• Registration Fee must be > 0.")
+            if reg_bool and register_fee <= 0:
+                st.session_state["admin_errors"]["show_reg_fee_error"] = "Registration Fee must be > 0"
+            else: st.session_state["admin_errors"].pop("show_reg_fee_error", None)
             
-            if errors:
-                st.error("Please fix the following before creating a new client:\n\n" + "\n\n".join(errors))
+            if st.session_state["admin_errors"]: #only keys with error msg will be included
+                st.rerun()
             else:
                 assigned_user_id = users_df.loc[users_df["combined"] == assigned_user, "id"].iloc[0]
-                assigned_user_name = users_df.loc[users_df["combined"] == assigned_user, "user_name"].iloc[0]
                 new_client = {
                     "client_name": name.upper(),
                     "assigned_user_id": int(assigned_user_id),
-                    "assigned_user_name": assigned_user_name,
                     "pay_frequency": pay_frequency,
                     "pay_start_date": pay_start_date.isoformat(),
                     "processing_date": processing_date.isoformat(),
@@ -1246,6 +1561,7 @@ with tabs[1]:
                     "use_pct_increase": 1,
                     "payroll_registration": int(reg_bool),
                     "registration_fee": register_fee,
+                    "free_state_used": 0,
                     "fee_increase_effective_date": plus_one_year(pay_start_date).isoformat(),
                     "incr_base_fee": pct_increase(base_fee, inc_pct),
                     "incr_add_state_fee": pct_increase(add_state_fee, inc_pct),
@@ -1253,8 +1569,9 @@ with tabs[1]:
                 }
 
                 new_entry("clients", new_client)
-                st.session_state["new_client"] = True  # non-widget key, safe to set
-                set_page("admin_main")            # back to Admin initial view
+                st.session_state["new_client"] = True
+                st.session_state["admin_errors"] = {}
+                set_page("admin_main")
                 st.rerun()
 
 
@@ -1268,14 +1585,17 @@ with tabs[1]:
         df = show_clients(True)
 
         if df.empty:
-            if st.session_state.pop("reactivated_msg", False):
-                st.success("Client reactivated. No terminated clients now.")
+            if st.session_state.get("reactivated_msg"):
+                c_name = st.session_state["reactivated_msg"]
+                st.session_state.pop("reactivated_msg")
+                st.success(f"**{c_name}** is reactivated. No terminated clients now.")
             else:
                 st.info("No terminated clients.")
         else:
-            if st.session_state.pop("reactivated_msg", False):
-                st.success("Client reactivated.")
-                fade_message()
+            if st.session_state.get("reactivated_msg"):
+                c_name = st.session_state["reactivated_msg"]
+                st.session_state.pop("reactivated_msg")
+                st.success(f"**{c_name}** is reactivated.")
             st.markdown("<br><br>", unsafe_allow_html=True)
 
             header = st.columns((1, 2, 2, 2, 2), gap="small")
@@ -1293,7 +1613,7 @@ with tabs[1]:
                         reactivate_dialog(int(row["id"]), row['client_name'], row["fee_increase_effective_date"])
                     else:
                         update_entry("clients", int(row["id"]), {"terminated": 0})
-                        st.session_state["reactivated_msg"] = True
+                        st.session_state["reactivated_msg"] = row['client_name']
                         st.rerun()
 
                 cols[1].markdown(f"<p style='{style_css}'>{row['client_name']}</p>", unsafe_allow_html=True)
@@ -1312,9 +1632,8 @@ with tabs[1]:
 
         st.markdown(f"### Collections for {client.client_name}")
 
-        display_cols = ["id", "pay_start_date", "pay_end_date", "cost", "collected",
-                        "collection_description", "collection_date"]
-        df = get_client_payments(client_id, "processing_date", display_cols)
+        display_cols = ["id", "pay_start_date", "pay_end_date", "cost", "collected", "collection_description", "collection_date"]
+        df = get_client_payments(client_id, display_cols=display_cols)
         if df.empty:
             if st.button("← Back"):
                 set_page("admin_main")
@@ -1330,7 +1649,7 @@ with tabs[1]:
                     "pay_start_date": st.column_config.DateColumn("Pay Start date", disabled=True, format="localized"),
                     "pay_end_date": st.column_config.DateColumn("Pay End date", disabled=True, format="localized"),
                     "cost": st.column_config.NumberColumn("Total Fee", disabled=True, format="dollar"),
-                    "collected": st.column_config.NumberColumn("Total Collected", min_value=0.00, step=0.01, format="dollar", default=None),
+                    "collected": st.column_config.NumberColumn("Total Collected", min_value=0.00, step=0.01, format="dollar"),
                     "collection_description": st.column_config.TextColumn("Collection Description"),
                     "collection_date": st.column_config.TextColumn("Collection Date", max_chars=10, help="Enter date as MM/DD/YYYY",
                                                                    validate=r"^$|^(0[1-9]|1[0-2])/(0[1-9]|[12][0-9]|3[01])/[0-9]{4}$")
@@ -1355,7 +1674,7 @@ with tabs[1]:
                 if error:
                     st.error(error)
                 else:
-                    st.session_state["collections_saved"] = True
+                    st.session_state["collections_saved"] = client.client_name
                     set_page("admin_main")
                     st.rerun()
 
@@ -1363,30 +1682,41 @@ with tabs[1]:
     elif page == "add_user":
         st.markdown("### New User")
 
+        if "user_errors" not in st.session_state:
+            st.session_state["user_errors"] = {}
+
         a, b, c = st.columns(3)
         name = a.text_input("Name*", value=None)
+        if msg := get_err("user_errors", "show_name_error"): a.error(msg)
         email = b.text_input("Email Address (login username)*", value=None)
-        user_type = c.selectbox("User Type*", ["Employee", "Admin"], index=0)
+        if msg := get_err("user_errors", "show_email_error"): b.error(msg)
+        user_type = c.selectbox("User Type*", ["None", "Employee", "Admin"], index=0)
+        if msg := get_err("user_errors", "new_user_type_error"): c.error(msg)
 
         a_col, b_col = st.columns([1, 1])
         create_clicked = a_col.button("Create Employee", type="primary", width='stretch')
         cancel_clicked = b_col.button("Cancel", width='stretch')
 
         if cancel_clicked:
+            st.session_state["user_errors"] = {}
             set_page("admin_main")
             st.rerun()
 
         if create_clicked:
-            errors = []
             if not name:
-                errors.append("• Name is required.")
+                st.session_state["user_errors"]["show_name_error"] = "Name is required."
+            else: st.session_state["user_errors"].pop("show_name_error", None)
             if not email:
-                errors.append("• Email Address is required.")
+                st.session_state["user_errors"]["show_email_error"] =  "Email Address is required."
             elif not email.strip().lower().endswith("@gmail.com"):
-                errors.append("• Email Address must be in the 'gmail' domain")
-            
-            if errors:
-                st.error("Please fix the following before creating a new user:\n\n" + "\n\n".join(errors))
+                st.session_state["user_errors"]["show_email_error"] = "Email Address must be in the 'gmail' domain"
+            else: st.session_state["user_errors"].pop("show_email_error", None)
+            if user_type == "None":
+                st.session_state["user_errors"]["new_user_type_error"] = "Select the type of user."
+            else: st.session_state["user_errors"].pop("new_user_type_error", None)
+
+            if st.session_state["user_errors"]:
+                st.rerun()
             else:
                 new_user = {
                     "user_name": name,
@@ -1397,8 +1727,9 @@ with tabs[1]:
                 }
 
                 new_entry("users", new_user)
-                st.session_state["new_user"] = True  # non-widget key, safe to set
-                set_page("admin_main")              # back to Admin initial view
+                st.session_state["new_user"] = True
+                st.session_state["new_user_errors"] = {}
+                set_page("admin_main")
                 st.rerun()
 
 
@@ -1407,34 +1738,39 @@ with tabs[1]:
             set_page("admin_main")
             st.rerun()
         
-        st.markdown("### Delete User")
+        st.markdown("### Delete Users")
 
-        if st.session_state.pop("deleted_msg", False):
-            st.success("Deleted a user")
+        if st.session_state.get("deleted_msg"):
+            u_name = st.session_state["deleted_msg"]
+            st.session_state.pop("deleted_msg")
+            st.success(f"Deleted the user: {u_name}")
             fade_message()
         
         header = st.columns((1, 2, 2, 2), gap="small")
-        header[1].markdown("<p style='text-align:center; font-weight:bold;'>User Name</p>", unsafe_allow_html=True)
-        header[2].markdown("<p style='text-align:center; font-weight:bold;'>User Type</p>", unsafe_allow_html=True)
-        header[3].markdown("<p style='text-align:center; font-weight:bold;'>Email Address</p>", unsafe_allow_html=True)
+        header[1].markdown("<p class='header-style'>User Name</p>", unsafe_allow_html=True)
+        header[2].markdown("<p class='header-style'>User Type</p>", unsafe_allow_html=True)
+        header[3].markdown("<p class='header-style'>Email Address</p>", unsafe_allow_html=True)
 
         users_df = get_users()
         for _, row in users_df.iterrows():
             cols = st.columns((1, 2, 2, 2), gap="small")
-            style_css = "display:flex; justify-content:center; align-items:center; height:2.5rem;"
             
             with cols[0]:
                 disabled_status = True if int(row['permanent']) == 1 else False
                 help_status = "Permanent user, cannot delete" if int(row['permanent']) == 1 else None
 
                 if st.button("Delete", key=f"react_{int(row['id'])}", disabled=disabled_status, help=help_status):
-                    confirm_delete_user_dialog(int(row["id"]), row["user_name"])
+                    assigned_clients = get_clients_for_user(int(row["id"]))
+                    if assigned_clients:
+                        cannot_delete_user_dialog(row["user_name"], assigned_clients)
+                    else:
+                        confirm_delete_user_dialog(int(row["id"]), row["user_name"])
 
-            cols[1].markdown(f"<p style='{style_css}'>{row['user_name']}</p>", unsafe_allow_html=True)
-            cols[2].markdown(f"<p style='{style_css}'>{row['user_type']}</p>", unsafe_allow_html=True)
-            cols[3].markdown(f"<p style='{style_css}'>{row['email']}</p>", unsafe_allow_html=True)
+            cols[1].markdown(f"<p class='value-style'>{row['user_name']}</p>", unsafe_allow_html=True)
+            cols[2].markdown(f"<p class='value-style'>{row['user_type']}</p>", unsafe_allow_html=True)
+            cols[3].markdown(f"<p class='value-style'>{row['email']}</p>", unsafe_allow_html=True)
             st.markdown("<hr style='margin: 0.0rem 0;'>", unsafe_allow_html=True)
-        
+    
     
     elif page == "user_view":
         if st.button("← Back"):
@@ -1443,15 +1779,17 @@ with tabs[1]:
 
         st.markdown(f"### User Information")
 
-        users_df = get_users()
+        users_df = get_users(["id", "user_name", "user_type", "email", "password"])
         ids = users_df["id"]
         users_df = users_df.drop(columns=["id"])
         edited = st.data_editor(users_df, width='stretch', hide_index=True,
                                 column_config={
                                     "user_name": st.column_config.TextColumn("Name"),
-                                    "user_type": st.column_config.TextColumn("User Type"),
-                                    "email": st.column_config.TextColumn("Email Address"),
-                                    "password": st.column_config.TextColumn("Password"),
+                                    "user_type": st.column_config.TextColumn("User Type", 
+                                                                             help="Can only be Employee or Admin"),
+                                    "email": st.column_config.TextColumn("Email Address", 
+                                                                         help="Has to end in @gmail.com"),
+                                    "password": st.column_config.TextColumn("Password")
                                 }, key=f"admin_user_editor"
         )
         edited["id"] = ids.values
@@ -1479,9 +1817,9 @@ with tabs[1]:
             set_page("main")
             st.rerun()
 
-        st.markdown("### Reports")
+        st.markdown("## Reports")
 
-        st.markdown("#### 1) Fee Increase Effective Date Report")
+        st.markdown("### 1) Fee increase effective dates")
         col3, col4 = st.columns([1, 4])
         with col3:
             df_fut = df_effective_dates()
@@ -1489,7 +1827,7 @@ with tabs[1]:
             st.download_button(
                 label="⬇️ Download CSV",
                 data=csv_fut,
-                file_name="effective_date_report.csv",
+                file_name="Effective Date Report.csv",
                 mime="text/csv",
                 key="dl_eff_date",
             )
@@ -1501,7 +1839,7 @@ with tabs[1]:
 
         st.markdown("---")
 
-        st.markdown("#### 2) Collections overview (by processing date range)")
+        st.markdown("### 2) Accounts receivable by client")
         f1, f2, f3 = st.columns(3, vertical_alignment="bottom")
         with f1:
             range_start = st.date_input("Range start*", value=None, key="rep_range_start", format="MM/DD/YYYY")
@@ -1514,7 +1852,7 @@ with tabs[1]:
         if valid:
             range_overview_df = df_collections_overview_range(range_start, range_end)
             csv_bytes = range_overview_df.to_csv(index=False).encode("utf-8")
-            file_name = f"collections_overview_{range_start.isoformat()}_to_{range_end.isoformat()}.csv"
+            file_name = f"Accounts Receivable {range_start.isoformat()} to {range_end.isoformat()}.csv"
         
         with f3:
             st.download_button(
@@ -1533,7 +1871,7 @@ with tabs[1]:
         
         st.markdown("---")
 
-        st.markdown("#### 3) Number of employees processed in each payment period for all clients (by processing date range)")
+        st.markdown("### 3) Number of employees processed by client")
         g1, g2, g3 = st.columns(3, vertical_alignment="bottom")
         with g1:
             range_start = st.date_input("Range start*", value=None, key="ee_range_start", format="MM/DD/YYYY")
@@ -1544,7 +1882,7 @@ with tabs[1]:
         file_ee_name = ""
         csv_ee_bytes = None
         if ee_valid:
-            employees_df = df_num_employees_in_range(range_start, range_end)
+            employees_df = df_sum_employees_in_range(range_start, range_end)
             csv_ee_bytes = employees_df.to_csv(index=False).encode("utf-8")
             file_ee_name = f"employees_processed_{range_start.isoformat()}_to_{range_end.isoformat()}.csv"
         
